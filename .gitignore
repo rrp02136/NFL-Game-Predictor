@@ -1,0 +1,6 @@
+data/
+*.csv
+*.pkl
+*.joblib
+pipeline.log
+__pycache__/
