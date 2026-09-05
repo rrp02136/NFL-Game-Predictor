@@ -1,208 +1,223 @@
 """
-Feature Engineering Utility Functions for NFL Prediction Project
-Contains helper functions for creating predictive features from game data.
+Feature-engineering helpers.
+All rolling features are computed from a team's PRIOR games only (shift(1))
+so nothing from the game being predicted leaks in.
 """
 import logging
-import pandas as pd
 import numpy as np
-from sklearn.preprocessing import LabelEncoder
+import pandas as pd
 
-def compute_point_differential(df: pd.DataFrame, home_score_col: str,
-                               away_score_col: str) -> pd.DataFrame:
-    # Calculate point differential (home - away) (Analysis Only)
-    df = df.copy()
-    if home_score_col in df.columns and away_score_col in df.columns:
-        df['point_diff'] = df[home_score_col] - df[away_score_col]
-        logging.debug("Point differential computed")
-    else:
-        logging.warning(f"Could not compute point differential: missing columns")
-    return df
 
-def compute_epa_differentials(df: pd.DataFrame, config) -> pd.DataFrame:
-    # Calculate EPA differentials (home - away) for various metrics
-    df = df.copy()
+def build_team_game_long(schedules: pd.DataFrame, pbp_agg: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert the wide (home/away per row) schedule into a long team-game frame:
+    one row per (game_id, team). Attach that team's offensive PBP aggregates
+    and the OPPONENT's offensive aggregates (which are that team's defensive stats).
+    """
+    played = schedules.dropna(subset=['home_score', 'away_score']).copy()
 
-    epa_pairs = [
-        (config.HOME_TOTAL_EPA_COL, config.AWAY_TOTAL_EPA_COL, 'epa_diff'),
-        (config.HOME_PASS_EPA_COL, config.AWAY_PASS_EPA_COL, 'pass_epa_diff'),
-        (config.HOME_RUSH_EPA_COL, config.AWAY_RUSH_EPA_COL, 'rush_epa_diff'),
-        (config.HOME_OFF_EPA_COL, config.AWAY_OFF_EPA_COL, 'off_epa_diff'),
-        (config.HOME_DEF_EPA_COL, config.AWAY_DEF_EPA_COL, 'def_epa_diff'),
+    home = played[['game_id', 'season', 'week', 'gameday',
+                   'home_team', 'away_team',
+                   'home_score', 'away_score',
+                   'home_rest']].rename(columns={
+        'home_team': 'team', 'away_team': 'opp',
+        'home_score': 'pts_for', 'away_score': 'pts_against',
+        'home_rest': 'rest',
+    })
+    home['is_home'] = 1
+
+    away = played[['game_id', 'season', 'week', 'gameday',
+                   'away_team', 'home_team',
+                   'away_score', 'home_score',
+                   'away_rest']].rename(columns={
+        'away_team': 'team', 'home_team': 'opp',
+        'away_score': 'pts_for', 'home_score': 'pts_against',
+        'away_rest': 'rest',
+    })
+    away['is_home'] = 0
+
+    long = pd.concat([home, away], ignore_index=True)
+    long['won'] = (long['pts_for'] > long['pts_against']).astype(int)
+
+    # Attach the team's own offensive PBP aggregates
+    long = long.merge(pbp_agg, on=['game_id', 'season', 'week', 'team'], how='left')
+
+    # Attach opponent's offensive aggregates -> these become team's defensive-allowed stats
+    opp_agg = pbp_agg.rename(columns={
+        'team': 'opp',
+        'off_epa': 'def_epa_allowed',
+        'off_success': 'def_success_allowed',
+        'off_plays': 'def_plays_faced',
+        'off_ypp': 'def_ypp_allowed',
+        'off_pass_epa': 'def_pass_epa_allowed',
+        'off_rush_epa': 'def_rush_epa_allowed',
+    })
+    long = long.merge(opp_agg, on=['game_id', 'season', 'week', 'opp'], how='left')
+
+    long['gameday'] = pd.to_datetime(long['gameday'], errors='coerce')
+    long = long.sort_values(['team', 'gameday', 'week']).reset_index(drop=True)
+    return long
+
+
+def add_rolling_features(long: pd.DataFrame, window: int) -> pd.DataFrame:
+    """Rolling averages of prior N games per team, computed as shift(1).rolling(N)."""
+    stat_cols = [
+        'off_epa', 'off_success', 'off_ypp', 'off_pass_epa', 'off_rush_epa',
+        'def_epa_allowed', 'def_success_allowed', 'def_ypp_allowed',
+        'def_pass_epa_allowed', 'def_rush_epa_allowed',
+        'pts_for', 'pts_against', 'won',
     ]
-
-    for home_col, away_col, diff_col in epa_pairs:
-        if home_col and away_col and home_col in df.columns and away_col in df.columns:
-            df[diff_col] = df[home_col] - df[away_col]
-            logging.debug(f"Computed {diff_col}")
-        else:
-            logging.debug(f"Skipping {diff_col}: columns not available")
-
-    return df
-
-def aggregate_pbp_to_game(df_pbp: pd.DataFrame, config) -> pd.DataFrame:
-    # Aggregate play-by-play data to game-level features
-    if df_pbp is None or df_pbp.empty:
-        logging.warning("No play-by-play data to aggregate")
-        return pd.DataFrame()
-
-    logging.info(f"Aggregating play-by-play data: {len(df_pbp)} plays")
-
-    # Create game_id if not exists
-    if config.PBP_GAME_ID_COL not in df_pbp.columns:
-        df_pbp[config.PBP_GAME_ID_COL] = (
-                df_pbp[config.PBP_SEASON_COL].astype(str) + '_' +
-                df_pbp[config.PBP_WEEK_COL].astype(str) + '_' +
-                df_pbp[config.PBP_AWAY_TEAM_COL] + '_' +
-                df_pbp[config.PBP_HOME_TEAM_COL]
+    long = long.copy()
+    grp = long.groupby('team', sort=False)
+    for col in stat_cols:
+        long[f'{col}_r{window}'] = (
+            grp[col]
+            .transform(lambda s: s.shift(1).rolling(window=window, min_periods=3).mean())
         )
+    return long
 
-    # Initialize aggregation dictionary
-    agg_data = []
 
-    # Group by game
-    for game_id, game_plays in df_pbp.groupby(config.PBP_GAME_ID_COL):
-        game_dict = {'game_id': game_id}
+def compute_elo(schedules: pd.DataFrame,
+                k: float, hfa: float, init: float, season_regress: float) -> pd.DataFrame:
+    """
+    Compute pre-game Elo for home & away team for every played game.
+    Season regression: at the start of each new season, rating = init + (1-regress) * (rating - init).
+    Returns DataFrame with columns: game_id, home_elo_pre, away_elo_pre.
+    """
+    played = schedules.dropna(subset=['home_score', 'away_score']).copy()
+    played['gameday'] = pd.to_datetime(played['gameday'], errors='coerce')
+    played = played.sort_values(['season', 'gameday', 'week']).reset_index(drop=True)
 
-        # Get home and away teams
-        home_team = game_plays[config.PBP_HOME_TEAM_COL].iloc[0]
-        away_team = game_plays[config.PBP_AWAY_TEAM_COL].iloc[0]
+    ratings: dict[str, float] = {}
+    last_season: dict[str, int] = {}
+    rows = []
 
-        # Aggregate for home team
-        home_plays = game_plays[game_plays[config.PBP_POSTEAM_COL].str.contains(home_team, na=False, case=False)]
-        away_plays = game_plays[game_plays[config.PBP_POSTEAM_COL].str.contains(away_team, na=False, case=False)]
+    for _, g in played.iterrows():
+        h, a, s = g['home_team'], g['away_team'], int(g['season'])
 
-        # Count total plays
-        game_dict['total_plays_home'] = len(home_plays)
-        game_dict['total_plays_away'] = len(away_plays)
+        # Season regression for each team when they first appear in a new season
+        for t in (h, a):
+            if t not in ratings:
+                ratings[t] = init
+                last_season[t] = s
+            elif last_season[t] != s:
+                ratings[t] = init + (1.0 - season_regress) * (ratings[t] - init)
+                last_season[t] = s
 
-        # Count scoring plays
-        if config.PBP_IS_SCORING_COL in game_plays.columns:
-            game_dict['scoring_plays_home'] = home_plays[config.PBP_IS_SCORING_COL].sum()
-            game_dict['scoring_plays_away'] = away_plays[config.PBP_IS_SCORING_COL].sum()
+        h_elo = ratings[h]
+        a_elo = ratings[a]
 
-        # Count scoring drives (unique drives that scored)
-        if config.PBP_IS_SCORING_DRIVE_COL in game_plays.columns:
-            game_dict['scoring_drives_home'] = home_plays[config.PBP_IS_SCORING_DRIVE_COL].sum()
-            game_dict['scoring_drives_away'] = away_plays[config.PBP_IS_SCORING_DRIVE_COL].sum()
+        # Expected home win prob (Elo with home-field advantage)
+        expected_home = 1.0 / (1.0 + 10.0 ** (-((h_elo + hfa) - a_elo) / 400.0))
+        actual_home = 1.0 if g['home_score'] > g['away_score'] else (0.5 if g['home_score'] == g['away_score'] else 0.0)
 
-        # Analyze play types
-        if config.PBP_PLAY_TYPE_COL in game_plays.columns:
-            for team_name, team_plays in [('home', home_plays), ('away', away_plays)]:
-                play_types = team_plays[config.PBP_PLAY_TYPE_COL].value_counts()
-                game_dict[f'pass_plays_{team_name}'] = play_types.get('Pass', 0)
-                game_dict[f'rush_plays_{team_name}'] = play_types.get('Rush', 0)
-                game_dict[f'kickoff_plays_{team_name}'] = play_types.get('Kickoff', 0)
-                game_dict[f'punt_plays_{team_name}'] = play_types.get('Punt', 0)
+        rows.append({'game_id': g['game_id'], 'home_elo_pre': h_elo, 'away_elo_pre': a_elo})
 
-        agg_data.append(game_dict)
+        # Update ratings for next game
+        delta = k * (actual_home - expected_home)
+        ratings[h] = h_elo + delta
+        ratings[a] = a_elo - delta
 
-    result_df = pd.DataFrame(agg_data)
-    logging.info(f"Aggregated to {len(result_df)} games with {len(result_df.columns)} features")
+    return pd.DataFrame(rows)
 
-    return result_df
 
-def calculate_rolling_averages(df: pd.DataFrame, team_col: str, stat_cols: list,
-                               window: int = 3, season_col: str = None) -> pd.DataFrame:
-    # Calculate rolling averages for team statistics
-    df = df.copy()
-    df = df.sort_values(['Season', 'Week'] if 'Season' in df.columns else ['Week'])
+def build_game_features(schedules: pd.DataFrame, pbp_agg: pd.DataFrame, config) -> pd.DataFrame:
+    """
+    Return one row per played game with pre-game features and the target `home_win`.
+    Betting lines are kept for later ATS analysis but NOT used as model features.
+    """
+    logging.info("Building team-game long table...")
+    long = build_team_game_long(schedules, pbp_agg)
 
-    for stat_col in stat_cols:
-        if stat_col not in df.columns:
-            logging.debug(f"Skipping rolling average for missing column: {stat_col}")
-            continue
+    logging.info(f"Adding rolling features (window={config.ROLLING_WINDOW})...")
+    long = add_rolling_features(long, window=config.ROLLING_WINDOW)
 
-        rolling_col_name = f'{stat_col}_rolling_{window}'
+    # Pivot to home/away
+    home_cols = long[long['is_home'] == 1].copy()
+    away_cols = long[long['is_home'] == 0].copy()
 
-        if season_col:
-            # Calculate within each season separately
-            df[rolling_col_name] = df.groupby([team_col, season_col])[stat_col].transform(
-                lambda x: x.shift(1).rolling(window=window, min_periods=1).mean()
-            )
-        else:
-            # Calculate across all games
-            df[rolling_col_name] = df.groupby(team_col)[stat_col].transform(
-                lambda x: x.shift(1).rolling(window=window, min_periods=1).mean()
-            )
+    r = config.ROLLING_WINDOW
+    rolling_stats = [
+        f'off_epa_r{r}', f'off_success_r{r}', f'off_ypp_r{r}',
+        f'off_pass_epa_r{r}', f'off_rush_epa_r{r}',
+        f'def_epa_allowed_r{r}', f'def_success_allowed_r{r}', f'def_ypp_allowed_r{r}',
+        f'def_pass_epa_allowed_r{r}', f'def_rush_epa_allowed_r{r}',
+        f'pts_for_r{r}', f'pts_against_r{r}', f'won_r{r}',
+    ]
+    keep = ['game_id', 'season', 'week', 'gameday', 'team', 'rest'] + rolling_stats
 
-        logging.debug(f"Created rolling average: {rolling_col_name}")
+    h = home_cols[keep].rename(columns={'team': 'home_team', 'rest': 'home_rest',
+                                        **{c: f'home_{c}' for c in rolling_stats}})
+    a = away_cols[keep].rename(columns={'team': 'away_team', 'rest': 'away_rest',
+                                        **{c: f'away_{c}' for c in rolling_stats}})
 
-    return df
+    games = h.merge(a, on=['game_id', 'season', 'week', 'gameday'])
 
-def encode_teams(df: pd.DataFrame, team_cols: list, fit: bool = True,
-                encoders: dict = None) -> tuple:
-    # Encode team names to numeric values using LabelEncoder
-    df = df.copy()
+    # Differential features (home - away)
+    for stat in rolling_stats:
+        games[f'{stat}_diff'] = games[f'home_{stat}'] - games[f'away_{stat}']
 
-    if encoders is None:
-        encoders = {}
+    games['rest_diff'] = games['home_rest'] - games['away_rest']
 
-    for col in team_cols:
-        if col not in df.columns:
-            logging.warning(f"Column {col} not found for encoding")
-            continue
+    # Merge schedule context: weather, roof, div_game, betting lines, scores
+    sched = schedules[['game_id', 'game_type', 'div_game', 'roof',
+                       'temp', 'wind', 'spread_line', 'total_line',
+                       'home_score', 'away_score', 'home_moneyline', 'away_moneyline']].copy()
+    games = games.merge(sched, on='game_id', how='left')
 
-        encoded_col_name = f'{col}_encoded'
+    # Roof: outdoor games get real temp/wind; indoor treat as neutral
+    games['roof_outdoor'] = (games['roof'] == 'outdoors').astype(int)
+    games['temp'] = np.where(games['roof_outdoor'] == 1, games['temp'], 70.0)
+    games['wind'] = np.where(games['roof_outdoor'] == 1, games['wind'], 0.0)
+    games['temp'] = games['temp'].fillna(70.0)
+    games['wind'] = games['wind'].fillna(0.0)
 
-        if fit:
-            # Fit new encoder
-            encoder = LabelEncoder()
-            df[encoded_col_name] = encoder.fit_transform(df[col].astype(str))
-            encoders[col] = encoder
-            logging.debug(f"Fitted encoder for {col}: {len(encoder.classes_)} unique values")
-        else:
-            # Use existing encoder
-            if col not in encoders:
-                logging.error(f"No encoder found for {col}")
-                continue
-            encoder = encoders[col]
-            # Handle unseen categories
-            df[encoded_col_name] = df[col].apply(
-                lambda x: encoder.transform([x])[0] if x in encoder.classes_ else -1
-            )
-            logging.debug(f"Applied existing encoder for {col}")
+    games['is_playoff'] = (games['game_type'] != 'REG').astype(int)
+    games['div_game'] = games['div_game'].fillna(0).astype(int)
 
-    return df, encoders
+    # Elo
+    logging.info("Computing Elo ratings...")
+    elo = compute_elo(schedules, config.ELO_K, config.ELO_HFA,
+                      config.ELO_INIT, config.ELO_SEASON_REGRESS)
+    games = games.merge(elo, on='game_id', how='left')
+    games['elo_diff'] = games['home_elo_pre'] - games['away_elo_pre']
 
-def handle_missing_values(df: pd.DataFrame, strategy: dict) -> pd.DataFrame:
-    # Handle missing values according to specified strategy
-    df = df.copy()
+    # Target
+    games = games.dropna(subset=['home_score', 'away_score'])
+    games['home_win'] = (games['home_score'] > games['away_score']).astype(int)
 
-    for col, method in strategy.items():
-        if col not in df.columns:
-            continue
+    return games
 
-        missing_count = df[col].isna().sum()
-        if missing_count == 0:
-            continue
 
-        logging.info(f"Handling {missing_count} missing values in {col} using {method}")
+def select_feature_columns(games: pd.DataFrame, config) -> list[str]:
+    """Whitelist of pre-game features passed into the model."""
+    r = config.ROLLING_WINDOW
+    diffs = [
+        f'off_epa_r{r}_diff', f'off_success_r{r}_diff', f'off_ypp_r{r}_diff',
+        f'off_pass_epa_r{r}_diff', f'off_rush_epa_r{r}_diff',
+        f'def_epa_allowed_r{r}_diff', f'def_success_allowed_r{r}_diff',
+        f'def_ypp_allowed_r{r}_diff',
+        f'def_pass_epa_allowed_r{r}_diff', f'def_rush_epa_allowed_r{r}_diff',
+        f'pts_for_r{r}_diff', f'pts_against_r{r}_diff', f'won_r{r}_diff',
+    ]
+    other = [
+        'elo_diff', 'rest_diff',
+        'div_game', 'is_playoff', 'roof_outdoor', 'temp', 'wind',
+        'home_elo_pre', 'away_elo_pre',
+    ]
+    cols = [c for c in diffs + other if c in games.columns]
+    return cols
 
-        if method == 'median':
-            df[col].fillna(df[col].median(), inplace=True)
-        elif method == 'mean':
-            df[col].fillna(df[col].mean(), inplace=True)
-        elif method == 'mode':
-            df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else 0, inplace=True)
-        elif method == 'zero':
-            df[col].fillna(0, inplace=True)
-        elif method == 'drop':
-            df.dropna(subset=[col], inplace=True)
-        else:
-            logging.warning(f"Unknown strategy '{method}' for column {col}")
 
-    return df
-
-def create_game_id(df: pd.DataFrame, season_col: str, week_col: str,
-                   away_col: str, home_col: str) -> pd.DataFrame:
-    # Create unique game identifier from season, week, and team info
-    df = df.copy()
-    df['game_id'] = (
-            df[season_col].astype(str) + '_' +
-            df[week_col].astype(str) + '_' +
-            df[away_col].astype(str) + '_' +
-            df[home_col].astype(str)
-    )
-    logging.debug("Created game_id column")
-    return df
-
+def drop_early_season_rows(games: pd.DataFrame, config) -> pd.DataFrame:
+    """
+    Rolling features need at least 3 prior games; drop rows where they're NaN.
+    Keeps Week 4+ of the first season and all subsequent seasons roughly intact.
+    """
+    r = config.ROLLING_WINDOW
+    key = f'off_epa_r{r}_diff'
+    before = len(games)
+    games = games.dropna(subset=[key]).reset_index(drop=True)
+    logging.info(f"Dropped {before - len(games)} rows lacking rolling history "
+                 f"({len(games)} games remain)")
+    return games

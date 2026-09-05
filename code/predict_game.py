@@ -1,239 +1,190 @@
 """
-Prediction Script for Future NFL Games
-Load trained model and make predictions on new games
+Live prediction CLI.
+
+Single game:
+  python code/predict_game.py --home KC --away BAL --season 2026 --week 5
+
+Full week (uses the actual NFL schedule from nfl_data_py):
+  python code/predict_game.py --weekly 2026 5
+
+Both modes print the model's home win probability, the market-implied win
+probability from the closing (or current) line, the edge, and a suggested
+fractional-Kelly stake for the recommended side.
 """
+import argparse
+import json
 import logging
-import pandas as pd
-import joblib
-import sys
 import os
+import sys
+from math import erf
 
-def setup_logging():
-    # Setup basic logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
+import joblib
+import numpy as np
+import pandas as pd
+
+import config
+from utils_io import setup_logging
+from phase1_exploration import load_schedules, load_team_game_pbp_aggregates
+from utils_features import build_game_features
 
 
-def load_model_and_encoders(model_path, encoder_path):
-    # Load trained model and label encoders
-    logging.info(f"Loading model from {model_path}")
-    model = joblib.load(model_path)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'models', 'xgboost_best.pkl')
 
-    logging.info(f"Loading encoders from {encoder_path}")
-    encoders = joblib.load(encoder_path)
 
-    return model, encoders
+def _american_to_prob(odds):
+    if pd.isna(odds):
+        return np.nan
+    return (-odds) / (-odds + 100.0) if odds < 0 else 100.0 / (odds + 100.0)
 
-def load_feature_names(feature_names_path):
-    # Load feature names used during training
-    with open(feature_names_path, 'r') as f:
-        feature_names = [line.strip() for line in f.readlines()]
-    logging.info(f"Loaded {len(feature_names)} feature names")
-    return feature_names
 
-def encode_team_name(team_name, encoder, column_name):
-    # Encode team name using trained encoder
-    if team_name in encoder.classes_:
-        return encoder.transform([team_name])[0]
-    else:
-        logging.warning(f"Unknown team: {team_name}. Using -1")
-        return -1
+def _implied_home_prob(row) -> float:
+    hml = row.get('home_moneyline', np.nan)
+    aml = row.get('away_moneyline', np.nan)
+    if not pd.isna(hml) and not pd.isna(aml):
+        h = _american_to_prob(hml)
+        a = _american_to_prob(aml)
+        s = h + a
+        if s > 0:
+            return h / s
+    spread = row.get('spread_line', np.nan)
+    if not pd.isna(spread):
+        sigma = 13.86
+        return 0.5 * (1 + erf(spread / (sigma * (2 ** 0.5))))
+    return np.nan
 
-def prepare_game_input(home_team, away_team, season, week,
-                       encoders, feature_names,
-                       total_score=None, is_playoff=0):
-    # Prepare single game for prediction
-    # Use default total score if not provided (league average ~45)
-    if total_score is None:
-        total_score = 45.0
 
-    # Encode teams
-    home_encoded = encode_team_name(home_team, encoders['HomeTeam'], 'HomeTeam')
-    away_encoded = encode_team_name(away_team, encoders['AwayTeam'], 'AwayTeam')
+def _kelly_fraction(p: float, decimal_odds: float, fraction: float = 0.25) -> float:
+    """Fractional Kelly (default: quarter-Kelly). Returns 0 if no edge."""
+    b = decimal_odds - 1
+    if b <= 0:
+        return 0.0
+    q = 1 - p
+    f_full = (b * p - q) / b
+    return max(0.0, f_full * fraction)
 
-    # Create feature dictionary
-    features = {
-        'Season': season,
-        'HomeTeam_encoded': home_encoded,
-        'AwayTeam_encoded': away_encoded,
-        'total_score': total_score,
-        'PostSeason': is_playoff,
-        'is_playoff': is_playoff,
-        'week_numeric': week,
-        'week_of_season': week,
-        'season_period': 0 if week <= 6 else (1 if week <= 12 else 2)
+
+def _decimal_from_american(odds: float) -> float:
+    if pd.isna(odds):
+        return 1.909  # -110 default
+    return 1 + (odds / 100.0 if odds > 0 else 100.0 / -odds)
+
+
+def load_model_and_features():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"No trained model at {MODEL_PATH}. Run `python code/main.py` first.")
+    model = joblib.load(MODEL_PATH)
+    with open(config.FEATURE_NAMES_PATH) as f:
+        feature_cols = json.load(f)
+    return model, feature_cols
+
+
+def build_prediction_frame(season: int, week: int, home: str = None, away: str = None) -> pd.DataFrame:
+    """
+    Rebuild game features from cached schedules + PBP. This is exactly the same
+    engineering used at training time (so pre-game features come from PRIOR games).
+    Returns the row(s) matching the requested week (and optionally single matchup).
+    """
+    schedules = load_schedules(config)
+    pbp_agg = load_team_game_pbp_aggregates(config)
+
+    # Include the target week's rows even though scores are NaN, by temporarily
+    # marking them with dummy scores so build_team_game_long keeps them.
+    upcoming = schedules[(schedules['season'] == season) & (schedules['week'] == week)].copy()
+    if home and away:
+        upcoming = upcoming[(upcoming['home_team'] == home) & (upcoming['away_team'] == away)]
+    if upcoming.empty:
+        raise ValueError(f"No scheduled game(s) found for season={season} week={week} "
+                         f"home={home} away={away}")
+
+    # Give unplayed games dummy scores so they pass through feature building.
+    # They'll be dropped from the training target but retained here for feature lookup.
+    stub = schedules.copy()
+    mask = (stub['season'] == season) & (stub['week'] == week) & stub['home_score'].isna()
+    stub.loc[mask, 'home_score'] = 0
+    stub.loc[mask, 'away_score'] = 0
+
+    games = build_game_features(stub, pbp_agg, config)
+    from utils_features import drop_early_season_rows
+    games = drop_early_season_rows(games, config)
+
+    subset = games[(games['season'] == season) & (games['week'] == week)]
+    if home and away:
+        subset = subset[(subset['home_team'] == home) & (subset['away_team'] == away)]
+    if subset.empty:
+        raise ValueError("Games matched schedule but were dropped by feature engineering "
+                         "(insufficient rolling history). Try a later week.")
+    return subset.reset_index(drop=True)
+
+
+def format_prediction(row: pd.Series, model_prob: float) -> dict:
+    implied = _implied_home_prob(row)
+    edge = model_prob - implied if not pd.isna(implied) else np.nan
+
+    bet_side, kelly = None, 0.0
+    if not pd.isna(edge):
+        if edge >= config.BET_EDGE_THRESHOLD:
+            bet_side = row['home_team']
+            kelly = _kelly_fraction(model_prob, _decimal_from_american(row.get('home_moneyline', np.nan)))
+        elif edge <= -config.BET_EDGE_THRESHOLD:
+            bet_side = row['away_team']
+            kelly = _kelly_fraction(1 - model_prob, _decimal_from_american(row.get('away_moneyline', np.nan)))
+
+    return {
+        'season': int(row['season']),
+        'week': int(row['week']),
+        'home_team': row['home_team'],
+        'away_team': row['away_team'],
+        'spread_line': None if pd.isna(row.get('spread_line')) else float(row['spread_line']),
+        'model_home_prob': round(float(model_prob), 4),
+        'implied_home_prob': None if pd.isna(implied) else round(float(implied), 4),
+        'edge_home': None if pd.isna(edge) else round(float(edge), 4),
+        'suggested_side': bet_side,
+        'suggested_kelly_frac': round(float(kelly), 4),
     }
 
-    # Create DataFrame with all required features
-    df = pd.DataFrame([features])
 
-    # Ensure all features from training are present
-    for feature in feature_names:
-        if feature not in df.columns:
-            df[feature] = 0  # Add missing features with default value
+def predict(season: int, week: int, home: str = None, away: str = None) -> pd.DataFrame:
+    model, feature_cols = load_model_and_features()
+    games = build_prediction_frame(season, week, home, away)
+    X = games[feature_cols].fillna(0)
+    probs = model.predict_proba(X)[:, 1]
+    rows = [format_prediction(games.iloc[i], probs[i]) for i in range(len(games))]
+    return pd.DataFrame(rows)
 
-    # Reorder columns to match training order
-    df = df[feature_names]
-
-    return df
-
-def predict_game(model, game_df):
-    # Make prediction for game
-    prediction = model.predict(game_df)[0]
-    probabilities = model.predict_proba(game_df)[0]
-    home_win_prob = probabilities[1]
-
-    return prediction, home_win_prob
 
 def main():
-    # Main prediction function
-    setup_logging()
+    parser = argparse.ArgumentParser(description="NFL game prediction with betting-edge analysis.")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--home', type=str, help="Home team code (e.g. KC)")
+    group.add_argument('--weekly', nargs=2, metavar=('SEASON', 'WEEK'),
+                       help="Predict every game in a week: --weekly 2026 5")
+    parser.add_argument('--away', type=str, help="Away team code (with --home)")
+    parser.add_argument('--season', type=int, help="Season year (with --home)")
+    parser.add_argument('--week', type=int, help="Week number (with --home)")
+    parser.add_argument('--output', type=str, help="Optional CSV output path")
+    args = parser.parse_args()
 
-    # Paths
-    MODEL_PATH = "code/models/xgboost_best.pkl"  # Best model
-    ENCODER_PATH = "data/label_encoders.pkl"
-    FEATURE_NAMES_PATH = "data/feature_names.txt"
+    setup_logging(config.LOG_LEVEL, config.LOG_FILE)
 
-    # Load model and encoders
-    model, encoders = load_model_and_encoders(MODEL_PATH, ENCODER_PATH)
-    feature_names = load_feature_names(FEATURE_NAMES_PATH)
-
-    # Example prediction
-    logging.info("\nMAKING PREDICTION")
-
-    # Input game details
-    home_team = "Lions"
-    away_team = "Cowboys"
-    season = 2025
-    week = 14
-    total_score = 54.5
-
-    logging.info(f"Game: {away_team} @ {home_team}")
-    logging.info(f"Season: {season}, Week: {week}")
-
-    # Prepare input
-    game_input = prepare_game_input(
-        home_team=home_team,
-        away_team=away_team,
-        season=season,
-        week=week,
-        encoders=encoders,
-        feature_names=feature_names,
-        total_score=total_score,  # Estimated total score
-        is_playoff=0
-    )
-
-    # Make prediction
-    prediction, home_win_prob = predict_game(model, game_input)
-
-    # Display results
-    logging.info("\nPREDICTION RESULTS")
-    if prediction == 1:
-        logging.info(f"Predicted Winner: {home_team}")
-        logging.info(f"Confidence: {home_win_prob * 100:.1f}%")
+    if args.weekly:
+        season, week = int(args.weekly[0]), int(args.weekly[1])
+        df = predict(season, week)
+        default_out = os.path.join(config.RESULTS_DIR, f'predictions_week_{season}_{week}.csv')
     else:
-        logging.info(f"Predicted Winner: {away_team}")
-        logging.info(f"Confidence: {(1 - home_win_prob) * 100:.1f}%")
+        if not (args.away and args.season and args.week):
+            parser.error("--home requires --away, --season, and --week")
+        df = predict(args.season, args.week, args.home, args.away)
+        default_out = os.path.join(config.RESULTS_DIR,
+                                    f'prediction_{args.season}_{args.week}_{args.away}_at_{args.home}.csv')
 
-    logging.info(f"\nProbabilities:")
-    logging.info(f"  {home_team} Win: {home_win_prob * 100:.1f}%")
-    logging.info(f"  {away_team} Win: {(1 - home_win_prob) * 100:.1f}%")
+    print(df.to_string(index=False))
+    out = args.output or default_out
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"\nWrote {out}")
 
-def predict_multiple_games(games_list):
-    # Predict multiple games at once
-    setup_logging()
 
-    # Load model and encoders
-    MODEL_PATH = "code/models/xgboost_best.pkl"
-    ENCODER_PATH = "data/label_encoders.pkl"
-    FEATURE_NAMES_PATH = "data/feature_names.txt"
-
-    model, encoders = load_model_and_encoders(MODEL_PATH, ENCODER_PATH)
-    feature_names = load_feature_names(FEATURE_NAMES_PATH)
-
-    results = []
-
-    for game in games_list:
-        # Prepare input
-        game_input = prepare_game_input(
-            home_team=game['home_team'],
-            away_team=game['away_team'],
-            season=game['season'],
-            week=game['week'],
-            encoders=encoders,
-            feature_names=feature_names,
-            total_score=game.get('total_score', 45.0),
-            is_playoff=game.get('is_playoff', 0)
-        )
-
-        # Make prediction
-        prediction, home_win_prob = predict_game(model, game_input)
-
-        results.append({
-            'home_team': game['home_team'],
-            'away_team': game['away_team'],
-            'predicted_winner': game['home_team'] if prediction == 1 else game['away_team'],
-            'home_win_probability': home_win_prob,
-            'away_win_probability': 1 - home_win_prob
-        })
-
-    # Display results
-    results_df = pd.DataFrame(results)
-    logging.info("\nPREDICTIONS FOR MULTIPLE GAMES")
-    logging.info(f"\n{results_df.to_string(index=False)}")
-
-    return results_df
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-    games = [
-        {'home_team': 'Texans', 'away_team': 'Bills', 'season': 2024, 'week': 12, 'total_score': 43.5},
-        {'home_team': 'Lions', 'away_team': 'Giants', 'season': 2024, 'week': 12, 'total_score': 50.5},
-        {'home_team': 'Titans', 'away_team': 'Seahawks', 'season': 2024, 'week': 12, 'total_score': 40.5},
-        {'home_team': 'Bengals', 'away_team': 'Patriots', 'season': 2024, 'week': 12, 'total_score': 49.5},
-        {'home_team': 'Ravens', 'away_team': 'Jets', 'season': 2024, 'week': 12, 'total_score': 44.5},
-        {'home_team': 'Chiefs', 'away_team': 'Colts', 'season': 2024, 'week': 12, 'total_score': 50.5},
-        {'home_team': 'Packers', 'away_team': 'Vikings', 'season': 2024, 'week': 12, 'total_score': 41.5},
-        {'home_team': 'Bears', 'away_team': 'Steelers', 'season': 2024, 'week': 12, 'total_score': 45.5},
-        {'home_team': 'Cardinals', 'away_team': 'Jaguars', 'season': 2024, 'week': 12, 'total_score': 47.5},
-        {'home_team': 'Raiders', 'away_team': 'Browns', 'season': 2024, 'week': 12, 'total_score': 36.5},
-        {'home_team': 'Cowboys', 'away_team': 'Eagles', 'season': 2024, 'week': 12, 'total_score': 47.5},
-        {'home_team': 'Saints', 'away_team': 'Falcons', 'season': 2024, 'week': 12, 'total_score': 40.5},
-        {'home_team': 'Rams', 'away_team': 'Buccaneers', 'season': 2024, 'week': 12, 'total_score': 49.5},
-        {'home_team': '49ers', 'away_team': 'Panthers', 'season': 2024, 'week': 12, 'total_score': 49.5},
-        {'home_team': 'Lions', 'away_team': 'Packers', 'season': 2025, 'week': 13, 'total_score': 48.5},
-        {'home_team': 'Cowboys', 'away_team': 'Chiefs', 'season': 2025, 'week': 13, 'total_score': 52.5},
-        {'home_team': 'Bengals', 'away_team': 'Ravens', 'season': 2025, 'week': 13, 'total_score': 52.5},
-        {'home_team': 'Bears', 'away_team': 'Eagles', 'season': 2025, 'week': 13, 'total_score': 44.5},
-        {'home_team': 'Texans', 'away_team': 'Colts', 'season': 2025, 'week': 13, 'total_score': 44.5},
-        {'home_team': 'Rams', 'away_team': 'Panthers', 'season': 2025, 'week': 13, 'total_score': 45.5},
-        {'home_team': '49ers', 'away_team': 'Browns', 'season': 2025, 'week': 13, 'total_score': 35.5},
-        {'home_team': 'Jaguars', 'away_team': 'Titans', 'season': 2025, 'week': 13, 'total_score': 41.5},
-        {'home_team': 'Cardinals', 'away_team': 'Buccaneers', 'season': 2025, 'week': 13, 'total_score': 44.5},
-        {'home_team': 'Saints', 'away_team': 'Dolphins', 'season': 2025, 'week': 13, 'total_score': 42.5},
-        {'home_team': 'Falcons', 'away_team': 'Jets', 'season': 2025, 'week': 13, 'total_score': 38.5},
-        {'home_team': 'Vikings', 'away_team': 'Seahawks', 'season': 2025, 'week': 13, 'total_score': 41.5},
-        {'home_team': 'Raiders', 'away_team': 'Chargers', 'season': 2025, 'week': 13, 'total_score': 40.5},
-        {'home_team': 'Bills', 'away_team': 'Steelers', 'season': 2025, 'week': 13, 'total_score': 45.5},
-        {'home_team': 'Broncos', 'away_team': 'Commanders', 'season': 2025, 'week': 13, 'total_score': 43.5},
-        {'home_team': 'Giants', 'away_team': 'Patriots', 'season': 2025, 'week': 13, 'total_score': 46.5},
-        {'home_team': 'Lions', 'away_team': 'Cowboys', 'season': 2025, 'week': 14, 'total_score': 54.5},
-        {'home_team': 'Falcons', 'away_team': 'Seahawks', 'season': 2025, 'week': 14, 'total_score': 44.5},
-        {'home_team': 'Bills', 'away_team': 'Bengals', 'season': 2025, 'week': 14, 'total_score': 52.5},
-        {'home_team': 'Packers', 'away_team': 'Bears', 'season': 2025, 'week': 14, 'total_score': 44.5},
-        {'home_team': 'Browns', 'away_team': 'Titans', 'season': 2025, 'week': 14, 'total_score': 33.5},
-        {'home_team': 'Jaguars', 'away_team': 'Colts', 'season': 2025, 'week': 14, 'total_score': 47.5},
-        {'home_team': 'Vikings', 'away_team': 'Commanders', 'season': 2025, 'week': 14, 'total_score': 41.5},
-        {'home_team': 'Jets', 'away_team': 'Dolphins', 'season': 2025, 'week': 14, 'total_score': 41.5},
-        {'home_team': 'Ravens', 'away_team': 'Steelers', 'season': 2025, 'week': 14, 'total_score': 42.5},
-        {'home_team': 'Raiders', 'away_team': 'Broncos', 'season': 2025, 'week': 14, 'total_score': 40.5},
-        {'home_team': 'Cardinals', 'away_team': 'Rams', 'season': 2025, 'week': 14, 'total_score': 48.5},
-        {'home_team': 'Chiefs', 'away_team': 'Texans', 'season': 2025, 'week': 14, 'total_score': 41.5},
-        {'home_team': 'Chargers', 'away_team': 'Eagles', 'season': 2025, 'week': 14, 'total_score': 40.5}
-    ]
-    predict_multiple_games(games)
-
-

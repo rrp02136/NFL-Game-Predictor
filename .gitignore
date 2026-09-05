@@ -1,6 +1,11 @@
 data/
-*.csv
-*.pkl
-*.joblib
+results/
+code/pipeline.log
 pipeline.log
+*.pkl
+*.parquet
+*.joblib
 __pycache__/
+.venv/
+.idea/
+.DS_Store
