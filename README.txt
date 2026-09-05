@@ -1,218 +1,160 @@
 # NFL Game Outcome Prediction
-### Final Project — CSIC 4170/6170 (Intro to Computational Investing)
 
-This project implements an end-to-end machine learning pipeline that predicts NFL game outcomes using historical pre-game data from 2017–2025. The system performs data exploration, cleaning, feature engineering, model training, evaluation, and automated predictions for both single games and entire weeks. The pipeline is designed to be reproducible, modular, and deployable.
+Machine-learning pipeline for predicting NFL regular-season and playoff game
+winners, plus a betting-edge analysis that compares model probabilities to
+sportsbook implied probabilities.
 
----
-
-## 1. Project Structure
-
-```
-.
-├── code/
-│   ├── config.py
-│   ├── main.py
-│   ├── phase1_exploration.py
-│   ├── phase2_preprocessing.py
-│   ├── phase3_models.py
-│   ├── phase4_evaluation.py
-│   ├── predict_game.py
-│   ├── utils_features.py
-│   └── utils_io.py
-├── data/
-│   ├── raw/                    # raw CSVs
-│   ├── cleaned_games.csv
-│   ├── label_encoders.pkl
-│   ├── feature_names.json
-├── code/models/
-│   ├── random_forest_best.pkl
-│   └── xgboost_best.pkl
-├── plots/
-│   ├── RandomForest_confusion_matrix.png
-│   ├── XGBoost_confusion_matrix.png
-│   ├── RandomForest_feature_importances.png
-│   └── XGBoost_feature_importances.png
-└── results/
-    ├── model_comparison.csv
-    └── predictions_week_<season>_<week>_pretty.csv
-```
+Data source: [nflverse](https://nflverse.nflverse.com/) via the `nfl_data_py`
+package (schedules 2002–present including betting lines, rest days, weather,
+and division flags; play-by-play with EPA/success back to 2002).
 
 ---
 
-## 2. Environment Setup
+## 1. Setup
 
-### Create environment & install dependencies
 ```bash
-# Option A: Conda
-conda create -n nflpred python=3.10 -y
-conda activate nflpred
-pip install -r requirements.txt
-
-# Option B: Virtual environment (pip)
-python -m venv .venv
+python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### requirements.txt (recommended)
-```
-pandas>=2.0
-numpy>=1.24
-scikit-learn>=1.4
-xgboost>=2.0
-matplotlib>=3.8
-joblib>=1.3
+macOS users training XGBoost need OpenMP:
+
+```bash
+brew install libomp
 ```
 
 ---
 
-## 3. Configure the Project
-
-Open `code/config.py` and set:
-
-```python
-GAME_CSV_PATHS = ["data/raw/games_2017_2025.csv"]
-PBP_CSV_PATHS  = []  # optional play-by-play
-
-MODELS_DIR = "code/models"
-OUTPUT_DIR = "results"
-CLEANED_DATA_PATH = "data/cleaned_games.csv"
-
-SEASON_COL = "Season"
-WEEK_COL   = "Week"
-HOME_TEAM_COL = "HomeTeam"
-AWAY_TEAM_COL = "AwayTeam"
-HOME_SCORE_COL = "HomeScore"
-AWAY_SCORE_COL = "AwayScore"
-
-TARGET_COL = "HomeWin"
-
-TIME_BASED_SPLIT = False
-TEST_SIZE = 0.2
-RANDOM_STATE = 42
-
-FILTER_REGULAR_SEASON_ONLY = True
-USE_PLAY_BY_PLAY = False
-```
-
-Place your raw CSV data inside:
-**`data/raw/`**
-
----
-
-## 4. Run the Full Pipeline (Training + Evaluation)
-
-Run the main script:
+## 2. Run the pipeline
 
 ```bash
 python code/main.py
 ```
 
-This performs:
+On first run this downloads ~2 GB of play-by-play (2002–current) and caches
+it as parquet under `data/cache/`. Subsequent runs skip the download.
+Force a refresh (e.g. to pull the latest 2026 weekly results) with:
 
-1. Raw data validation + exploratory summary
-2. Cleaning, feature engineering, team encodings
-3. Train Random Forest & XGBoost (GridSearchCV)
-4. Save models, encoders, feature list
-5. Generate evaluation visualizations and comparison tables
+```bash
+python code/main.py --refresh-data
+```
 
-Outputs include:
+The pipeline:
 
-- `code/models/*.pkl`
-- `data/label_encoders.pkl`
-- `data/feature_names.json`
-- `plots/*.png`
+1. Pulls schedules + PBP from nflverse
+2. Builds per-team per-game EPA aggregates
+3. Engineers **pre-game-only** features: rolling (window=8) offensive/defensive
+   EPA, success rate, yards/play; Elo rating with season regression; rest
+   differential; div_game, weather (outdoor games), playoff flag
+4. Trains RandomForest + XGBoost with time-series CV
+5. Reports accuracy, log-loss, Brier score, reliability diagram, and an
+   against-the-spread backtest at the configured edge threshold
+
+Outputs:
+
+- `code/models/random_forest_best.pkl`, `code/models/xgboost_best.pkl`
+- `code/plots/*.png` (confusion, reliability, feature importance)
 - `results/model_comparison.csv`
+- `results/{random_forest,xgboost}_ats_bets.csv`
+- `data/game_features.parquet`, `data/feature_names.json`
 
 ---
 
-## 5. Making Predictions
+## 3. Make predictions
 
-### A. Predict a single game
+Single game:
+
 ```bash
-python code/predict_game.py \
-  --home "Lions" \
-  --away "Cowboys" \
-  --season 2025 \
-  --week 14
+python code/predict_game.py --home KC --away BAL --season 2026 --week 5
 ```
 
-Example output:
-```
-Predicted Winner: Lions
-Confidence: 54.9%
-Lions Win: 54.9%
-Cowboys Win: 45.1%
-```
+Full week:
 
----
-
-### B. Predict an entire week
 ```bash
-python code/predict_game.py --weekly 2025 14
+python code/predict_game.py --weekly 2026 5
 ```
 
-Outputs a formatted table plus a CSV at:
+Output columns:
+
 ```
-results/predictions_week_2025_14_pretty.csv
+season week home_team away_team spread_line model_home_prob
+implied_home_prob edge_home suggested_side suggested_kelly_frac
 ```
 
-Table columns:
+`suggested_side` is populated only when |model_prob − implied_prob| >=
+`BET_EDGE_THRESHOLD` (default 5 percentage points). `suggested_kelly_frac` is
+quarter-Kelly on the recommended side.
+
+Team codes follow the standard nflverse 2–3 letter codes: `KC`, `BAL`, `SF`,
+`LAR`, `NYG`, `NYJ`, `JAX`, `LV`, `LAC`, `WAS`, etc.
+
+---
+
+## 4. Configuration
+
+All knobs live in `code/config.py`:
+
+- `TRAIN_SEASON_START = 2002`, `CURRENT_SEASON = 2026`
+- `TEST_SEASONS = [2024, 2025]` — held out for honest test metrics
+- `ROLLING_WINDOW = 8`
+- `ELO_K`, `ELO_HFA`, `ELO_SEASON_REGRESS` — Elo hyperparameters
+- `BET_EDGE_THRESHOLD = 0.05` — minimum probability edge before flagging a bet
+- Hyperparameter grids for RF/XGB
+
+---
+
+## 5. Honest expectations & betting disclaimer
+
+- Straight-up NFL win prediction ceilings around **~65–68%** with strong
+  features. Anything above ~70% almost certainly means data leakage. The
+  reported numbers include a full test-set holdout on 2024–2025.
+- Beating the closing spread is much harder than picking winners. Pro sharps
+  hit **~53–55% ATS** long-term (break-even at -110 juice is 52.4%). Do not
+  expect this model to consistently beat that.
+- The Kelly fraction shown is **quarter-Kelly** — small on purpose. Even the
+  best models blow up bankrolls at full Kelly because true edges are smaller
+  than measured edges (variance and line movement work against you).
+- The backtest is retrospective and assumes the closing line — real-world
+  execution is worse. Track your actual results.
+- This is a research/educational project. Sports betting involves real risk of
+  loss. Bet only what you can afford to lose.
+
+---
+
+## 6. Project structure
+
 ```
-home_team | away_team | predicted_winner | home_win_probability | away_win_probability
+code/
+  config.py               # paths, feature params, grids, betting knobs
+  main.py                 # end-to-end pipeline
+  phase1_exploration.py   # nfl_data_py loaders + parquet caching
+  phase2_preprocessing.py # feature build orchestration
+  phase3_models.py        # time-series CV grid search
+  phase4_evaluation.py    # metrics, calibration, ATS backtest
+  predict_game.py         # CLI: single-game or weekly prediction
+  utils_features.py       # team-game long, rolling stats, Elo
+  utils_io.py             # logging + persistence helpers
+data/
+  cache/                  # parquet caches of nflverse pulls (gitignored)
+  game_features.parquet   # final engineered table (gitignored)
+  feature_names.json      # feature order used at inference
+results/                  # metrics + ATS bet logs (gitignored)
+code/models/              # trained model pickles
+code/plots/               # confusion, reliability, importance PNGs
 ```
 
 ---
 
-## 6. Reproducibility
+## 7. Retraining as the 2026 season progresses
 
-To ensure training and prediction use identical logic:
+`nfl_data_py` publishes new PBP roughly 24–48 hours after each game. To pull
+the latest results and retrain:
 
-- The pipeline **saves label encoders** → `data/label_encoders.pkl`
-- It saves **feature ordering** → `data/feature_names.json`
-- Prediction script loads both to avoid mismatched feature orders
+```bash
+python code/main.py --refresh-data
+```
 
-This prevents the common ML issue of “model expects X features but got Y”.
-
----
-
-## 7. Troubleshooting
-
-### Error: “X has N features, model expects M”
-Cause: mismatched columns during prediction.
-Fix: ensure `predict_game.py` loads `feature_names.json` and aligns columns before inference.
-
-### Warning: “X has feature names, but model fitted without feature names”
-Harmless. Fixed by passing `X.values` into `.predict_proba()`.
-
-### FutureWarning: pandas groupby apply
-Caused by rolling form features in `utils_features.py`.
-Can be silenced by adding `include_groups=False` if using pandas ≥ 2.2.
-
-### Unexpectedly high accuracy (>95%)
-This indicates leakage.
-Ensure game results or correlated columns (e.g., AwayWin, point_diff) are excluded.
-
----
-
-## 8. Updating the Dataset
-
-To train on new seasons:
-
-1. Add new rows to the raw CSV in `data/raw/`.
-2. Run `python code/main.py` again.
-3. New models/encoders overwrite previous artifacts.
-
----
-
-## 9. License
-
-Academic use for educational purposes.
-All datasets originally sourced from publicly available NFL records.
-
----
-
-## 10. Summary
-
-This repository contains a full machine-learning workflow for NFL win prediction, built to be modular, reproducible, and deployable. It supports full-season training, ensemble evaluation, and both single-game and multi-game predictions with confidence scores. The project’s structure and design make it easy to extend with additional features such as injury reports, betting lines, rolling performance metrics, or advanced play-by-play analytics.
-
+Early-season predictions (weeks 1–3) are always weaker because the rolling
+window is filled mostly with prior-season carryover. Trust the model more
+from week 4 onward.

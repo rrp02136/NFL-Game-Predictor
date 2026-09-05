@@ -71,17 +71,16 @@ def setup_logging(log_level: str = 'INFO', log_file: str = None) -> None:
 
     if log_file:
         ensure_directory(os.path.dirname(log_file))
-        handlers.append(logging.FileHandler(log_file))  # File handler
+        handlers.append(logging.FileHandler(log_file))
 
-        # Configure logging
-        logging.basicConfig(
-            level=getattr(logging, log_level.upper()),
-            format=log_format,
-            datefmt=date_format,
-            handlers=handlers,
-            force=True
-        )
+    logging.basicConfig(
+        level=getattr(logging, log_level.upper()),
+        format=log_format,
+        datefmt=date_format,
+        handlers=handlers,
+        force=True
+    )
 
-        logging.info("Logging initialized")
-        if log_file:
-            logging.info(f"Log file: {log_file}")
+    logging.info("Logging initialized")
+    if log_file:
+        logging.info(f"Log file: {log_file}")

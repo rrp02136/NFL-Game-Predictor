@@ -1,252 +1,180 @@
 """
-Phase 4: Model Evaluation and Comparison
-Evaluate trained models, generate visualizations, and compare performance.
+Phase 4: Evaluation + betting-relevant diagnostics.
+Beyond accuracy/AUC we report:
+  - Brier score & log-loss (calibration-sensitive)
+  - Reliability diagram (are 60% predictions winning 60%?)
+  - ATS backtest: does betting when |model_prob - implied_prob| >= threshold profit?
 """
 import logging
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix, roc_curve, auc
+    accuracy_score, log_loss, brier_score_loss, roc_auc_score, confusion_matrix
 )
-from utils_io import save_dataframe
-import os
+from utils_io import ensure_directory
 
-def evaluate_model(model, X_test: pd.DataFrame, y_test: pd.Series,
-                   model_name: str, config) -> dict:
-    # Evaluate trained model and calculate performance metrics
-    logging.info(f"Evaluating {model_name}...")
 
-    # Make predictions
+def _american_to_prob(odds: float) -> float:
+    if pd.isna(odds):
+        return np.nan
+    return (-odds) / (-odds + 100.0) if odds < 0 else 100.0 / (odds + 100.0)
+
+
+def evaluate_model(model, X_test, y_test, name: str) -> dict:
     y_pred = model.predict(X_test)
-    y_proba = model.predict_proba(X_test)[:, 1]
-
-    # Calculate metrics
+    y_prob = model.predict_proba(X_test)[:, 1]
     metrics = {
-        'model': model_name,
+        'model': name,
         'accuracy': accuracy_score(y_test, y_pred),
-        'precision': precision_score(y_test, y_pred, average='weighted', zero_division=0),
-        'recall': recall_score(y_test, y_pred, average='weighted', zero_division=0),
-        'f1_score': f1_score(y_test, y_pred, average='weighted', zero_division=0),
-        'roc_auc': roc_auc_score(y_test, y_proba)
+        'log_loss': log_loss(y_test, y_prob),
+        'brier': brier_score_loss(y_test, y_prob),
+        'roc_auc': roc_auc_score(y_test, y_prob),
     }
-
-    # Log metrics
-    logging.info(f"--- {model_name} Performance ---")
-    for metric, value in metrics.items():
-        if metric != 'model':
-            logging.info(f"  {metric}: {value:.4f}")
-
+    logging.info(f"[{name}] " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items() if k != 'model'))
     return metrics
 
-def plot_confusion_matrix(y_true: pd.Series, y_pred: np.ndarray,
-                         model_name: str, config) -> None:
-    # Create and save confusion matrix heatmap
-    logging.info(f"Creating confusion matrix for {model_name}...")
 
-    # Calculate confusion matrix
+def plot_confusion(y_true, y_pred, name: str, config):
     cm = confusion_matrix(y_true, y_pred)
-
-    # Create figure
     plt.figure(figsize=config.PLOT_FIGSIZE)
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Away Win', 'Home Win'],
-                yticklabels=['Away Win', 'Home Win'])
-    plt.title(f'Confusion Matrix - {model_name}')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
+                xticklabels=['Away Win', 'Home Win'], yticklabels=['Away Win', 'Home Win'])
+    plt.title(f'Confusion Matrix — {name}')
+    plt.ylabel('True'); plt.xlabel('Predicted')
     plt.tight_layout()
-
-    # Save figure
-    filepath = os.path.join(config.PLOTS_DIR, f'{model_name}_confusion_matrix.png')
-    plt.savefig(filepath, dpi=config.PLOT_DPI)
-    plt.close()
-
-    logging.info(f"Saved confusion matrix to {filepath}")
-
-def plot_feature_importance(model, feature_names: list, model_name: str, config) -> None:
-    # Create and save feature importance plot
-    logging.info(f"Creating feature importance plot for {model_name}...")
-
-    # Get feature importances
-    importances = model.feature_importances_
-
-    # Create DataFrame and sort
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': importances
-    }).sort_values('importance', ascending=False)
-
-    # Select top N features
-    top_features = importance_df.head(config.TOP_N_FEATURES)
-
-    # Create figure
-    plt.figure(figsize=(10, 8))
-    plt.barh(range(len(top_features)), top_features['importance'])
-    plt.yticks(range(len(top_features)), top_features['feature'])
-    plt.xlabel('Feature Importance')
-    plt.title(f'Top {config.TOP_N_FEATURES} Feature Importances - {model_name}')
-    plt.gca().invert_yaxis()
-    plt.tight_layout()
-
-    # Save figure
-    filepath = os.path.join(config.PLOTS_DIR, f'{model_name}_feature_importance.png')
-    plt.savefig(filepath, dpi=config.PLOT_DPI)
-    plt.close()
-
-    logging.info(f"Saved feature importance plot to {filepath}")
-
-    # Also log top 10 features
-    logging.info(f"Top 10 features for {model_name}:")
-    for idx, row in importance_df.head(10).iterrows():
-        logging.info(f"  {row['feature']}: {row['importance']:.4f}")
+    path = os.path.join(config.PLOTS_DIR, f'{name}_confusion_matrix.png')
+    plt.savefig(path, dpi=config.PLOT_DPI); plt.close()
+    logging.info(f"Saved {path}")
 
 
-def plot_roc_curve(y_true: pd.Series, y_proba: np.ndarray,
-                   model_name: str, config) -> None:
-    # Create and save ROC curve plot
-    logging.info(f"Creating ROC curve for {model_name}...")
-
-    # Calculate ROC curve
-    fpr, tpr, _ = roc_curve(y_true, y_proba)
-    roc_auc = auc(fpr, tpr)
-
-    # Create figure
+def plot_reliability(y_true, y_prob, name: str, config, n_bins: int = 10):
+    df = pd.DataFrame({'p': y_prob, 'y': y_true})
+    df['bin'] = pd.cut(df['p'], bins=np.linspace(0, 1, n_bins + 1), include_lowest=True)
+    agg = df.groupby('bin', observed=True).agg(mean_pred=('p', 'mean'),
+                                                 actual=('y', 'mean'),
+                                                 n=('y', 'size')).reset_index(drop=True)
     plt.figure(figsize=config.PLOT_FIGSIZE)
-    plt.plot(fpr, tpr, color='darkorange', lw=2,
-             label=f'ROC curve (AUC = {roc_auc:.3f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random Classifier')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'ROC Curve - {model_name}')
-    plt.legend(loc="lower right")
-    plt.grid(alpha=0.3)
+    plt.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect calibration')
+    plt.plot(agg['mean_pred'], agg['actual'], 'o-', label=name)
+    for _, row in agg.iterrows():
+        plt.annotate(f"n={int(row['n'])}", (row['mean_pred'], row['actual']),
+                     fontsize=8, textcoords='offset points', xytext=(5, 5))
+    plt.xlabel('Predicted probability'); plt.ylabel('Actual win rate')
+    plt.title(f'Reliability Diagram — {name}')
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+    path = os.path.join(config.PLOTS_DIR, f'{name}_reliability.png')
+    plt.savefig(path, dpi=config.PLOT_DPI); plt.close()
+    logging.info(f"Saved {path}")
+    return agg
+
+
+def plot_feature_importance(model, feature_names, name: str, config):
+    if not hasattr(model, 'feature_importances_'):
+        return
+    imp = pd.DataFrame({'feature': feature_names,
+                        'importance': model.feature_importances_}).sort_values('importance', ascending=False)
+    top = imp.head(config.TOP_N_FEATURES)
+    plt.figure(figsize=(10, 8))
+    plt.barh(range(len(top)), top['importance'])
+    plt.yticks(range(len(top)), top['feature'])
+    plt.gca().invert_yaxis()
+    plt.title(f'Top {config.TOP_N_FEATURES} Features — {name}')
     plt.tight_layout()
-
-    # Save figure
-    filepath = os.path.join(config.PLOTS_DIR, f'{model_name}_roc_curve.png')
-    plt.savefig(filepath, dpi=config.PLOT_DPI)
-    plt.close()
-
-    logging.info(f"Saved ROC curve to {filepath}")
-
-
-def plot_hyperparameter_tuning(cv_results: dict, param_name: str,
-                               model_name: str, config) -> None:
-    # Create and save hyperparameter tuning plot
-    try:
-        logging.info(f"Creating hyperparameter tuning plot for {model_name} - {param_name}...")
-
-        # Extract results
-        results_df = pd.DataFrame(cv_results)
-
-        # Filter to rows where only the target parameter varies
-        param_key = f'param_{param_name}'
-        if param_key not in results_df.columns:
-            logging.warning(f"Parameter {param_name} not found in CV results")
-            return
-
-        # Group by parameter value and get mean scores
-        param_scores = results_df.groupby(param_key)['mean_test_score'].mean().reset_index()
-        param_scores = param_scores.sort_values(param_key)
-
-        # Create figure
-        plt.figure(figsize=config.PLOT_FIGSIZE)
-        plt.plot(param_scores[param_key].astype(str), param_scores['mean_test_score'],
-                 marker='o', linewidth=2, markersize=8)
-        plt.xlabel(param_name)
-        plt.ylabel('Mean CV Accuracy')
-        plt.title(f'Hyperparameter Tuning: {param_name} - {model_name}')
-        plt.xticks(rotation=45)
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-
-        # Save figure
-        filepath = os.path.join(config.PLOTS_DIR, f'{model_name}_{param_name}_tuning.png')
-        plt.savefig(filepath, dpi=config.PLOT_DPI)
-        plt.close()
-
-        logging.info(f"Saved hyperparameter tuning plot to {filepath}")
-
-    except Exception as e:
-        logging.warning(f"Could not create hyperparameter plot for {param_name}: {str(e)}")
+    path = os.path.join(config.PLOTS_DIR, f'{name}_feature_importance.png')
+    plt.savefig(path, dpi=config.PLOT_DPI); plt.close()
+    logging.info(f"Saved {path}")
+    logging.info(f"Top 10 features for {name}:")
+    for _, row in imp.head(10).iterrows():
+        logging.info(f"  {row['feature']:40s}  {row['importance']:.4f}")
 
 
-def compare_models(rf_metrics: dict, xgb_metrics: dict, config) -> pd.DataFrame:
-    # Compare performance of Random Forest and XGBoost models.
-    logging.info("Comparing model performance...")
+def ats_backtest(test_context: pd.DataFrame, y_prob: np.ndarray, name: str, config) -> dict:
+    """
+    Convert spread_line to an implied home win probability using a normal-approx trick:
+    P(home covers ~= wins) ~ implied from moneyline; if moneyline missing, fall back to
+    approximating from spread with a 13.86-point sigma (historical NFL scoring stdev).
+    Bet home when model_prob - implied_prob > threshold; bet away otherwise (mirror).
+    ROI computed at -110 juice on 1-unit stakes.
+    """
+    ctx = test_context.copy()
+    ctx['model_home_prob'] = y_prob
 
-    # Create comparison DataFrame
-    comparison = pd.DataFrame([rf_metrics, xgb_metrics])
-    comparison = comparison.set_index('model')
+    # Prefer explicit home_moneyline if present; otherwise convert spread
+    home_ml = ctx['home_moneyline'].astype(float)
+    away_ml = ctx['away_moneyline'].astype(float)
+    implied_from_ml = home_ml.apply(_american_to_prob)
+    # Devig by symmetric normalization when both sides available
+    both = implied_from_ml + away_ml.apply(_american_to_prob)
+    both = both.where(both > 0, np.nan)
+    ctx['implied_home_prob'] = implied_from_ml / both
 
-    # Add winner column for each metric
-    for col in comparison.columns:
-        max_val = comparison[col].max()
-        comparison[f'{col}_winner'] = comparison[col].apply(
-            lambda x: '★' if x == max_val else ''
+    # Fallback: use spread_line if moneyline is missing (spread convention: negative = home favored)
+    missing = ctx['implied_home_prob'].isna() & ctx['spread_line'].notna()
+    from math import erf, sqrt
+    sigma = 13.86
+    if missing.any():
+        ctx.loc[missing, 'implied_home_prob'] = ctx.loc[missing, 'spread_line'].apply(
+            lambda s: 0.5 * (1 + erf(s / (sigma * (2 ** 0.5))))
         )
 
-    # Save comparison
-    save_dataframe(comparison, config.MODEL_COMPARISON_PATH, index=True)
+    ctx['edge'] = ctx['model_home_prob'] - ctx['implied_home_prob']
+    ctx['home_actual'] = ctx['home_win']
 
-    # Log formatted comparison
-    logging.info("\nMODEL COMPARISON")
-    logging.info(f"\n{comparison.to_string()}")
+    thr = config.BET_EDGE_THRESHOLD
+    bets = ctx[ctx['edge'].abs() >= thr].copy()
+    if bets.empty:
+        logging.info(f"[{name}] No bets clear the {thr:.0%} edge threshold")
+        return {'model': name, 'n_bets': 0, 'hit_rate': np.nan, 'roi': np.nan}
 
-    return comparison
+    # Bet home when edge > thr, bet away when edge < -thr
+    bets['bet_home'] = (bets['edge'] > 0).astype(int)
+    bets['won_bet'] = ((bets['bet_home'] == 1) & (bets['home_actual'] == 1)) | \
+                     ((bets['bet_home'] == 0) & (bets['home_actual'] == 0))
+    # -110 juice: risk 110 to win 100
+    payout = np.where(bets['won_bet'], 100 / 110, -1.0)
+    roi = payout.mean()
+    hit = bets['won_bet'].mean()
+
+    logging.info(f"[{name}] ATS backtest: bets={len(bets)}, hit={hit:.2%}, ROI={roi:+.2%} "
+                 f"(break-even hit = 52.4%)")
+
+    out_path = os.path.join(config.RESULTS_DIR, f'{name}_ats_bets.csv')
+    ensure_directory(config.RESULTS_DIR)
+    bets[['game_id', 'season', 'week', 'home_team', 'away_team', 'spread_line',
+          'model_home_prob', 'implied_home_prob', 'edge', 'bet_home',
+          'home_actual', 'won_bet']].to_csv(out_path, index=False)
+    logging.info(f"Saved {out_path}")
+
+    return {'model': name, 'n_bets': int(len(bets)), 'hit_rate': float(hit), 'roi': float(roi)}
 
 
-def evaluate_all_models(models_dict: dict, X_test: pd.DataFrame,
-                        y_test: pd.Series, feature_names: list, config) -> pd.DataFrame:
-    # Evaluate all trained models and generate comparison.
-    logging.info("\nEVALUATING ALL MODELS")
+def evaluate_all_models(models: dict, X_test, y_test, feature_names: list,
+                        test_context: pd.DataFrame, config) -> pd.DataFrame:
+    ensure_directory(config.PLOTS_DIR)
+    ensure_directory(config.RESULTS_DIR)
 
-    all_metrics = []
+    metric_rows = []
+    ats_rows = []
+    for name, entry in models.items():
+        model = entry['model']
+        y_prob = model.predict_proba(X_test)[:, 1]
+        y_pred = (y_prob >= 0.5).astype(int)
 
-    # Evaluate Random Forest
-    rf_model = models_dict['random_forest']['model']
-    rf_metrics = evaluate_model(rf_model, X_test, y_test, 'Random Forest', config)
-    all_metrics.append(rf_metrics)
+        metric_rows.append(evaluate_model(model, X_test, y_test, name))
+        plot_confusion(y_test, y_pred, name, config)
+        plot_reliability(y_test.values, y_prob, name, config)
+        plot_feature_importance(model, feature_names, name, config)
 
-    # Generate plots for Random Forest
-    y_pred_rf = rf_model.predict(X_test)
-    y_proba_rf = rf_model.predict_proba(X_test)[:, 1]
+        ats_rows.append(ats_backtest(test_context, y_prob, name, config))
 
-    plot_confusion_matrix(y_test, y_pred_rf, 'random_forest', config)
-    plot_feature_importance(rf_model, feature_names, 'random_forest', config)
-    plot_roc_curve(y_test, y_proba_rf, 'random_forest', config)
+    metrics_df = pd.DataFrame(metric_rows).set_index('model')
+    ats_df = pd.DataFrame(ats_rows).set_index('model')
+    combined = metrics_df.join(ats_df)
 
-    # Plot hyperparameter tuning for key parameters
-    rf_cv_results = models_dict['random_forest']['cv_results']
-    for param in ['n_estimators', 'max_depth']:
-        plot_hyperparameter_tuning(rf_cv_results, param, 'random_forest', config)
-
-    # Evaluate XGBoost
-    xgb_model = models_dict['xgboost']['model']
-    xgb_metrics = evaluate_model(xgb_model, X_test, y_test, 'XGBoost', config)
-    all_metrics.append(xgb_metrics)
-
-    # Generate plots for XGBoost
-    y_pred_xgb = xgb_model.predict(X_test)
-    y_proba_xgb = xgb_model.predict_proba(X_test)[:, 1]
-
-    plot_confusion_matrix(y_test, y_pred_xgb, 'xgboost', config)
-    plot_feature_importance(xgb_model, feature_names, 'xgboost', config)
-    plot_roc_curve(y_test, y_proba_xgb, 'xgboost', config)
-
-    # Plot hyperparameter tuning for key parameters
-    xgb_cv_results = models_dict['xgboost']['cv_results']
-    for param in ['n_estimators', 'max_depth', 'learning_rate']:
-        plot_hyperparameter_tuning(xgb_cv_results, param, 'xgboost', config)
-
-    # Compare models
-    comparison = compare_models(rf_metrics, xgb_metrics, config)
-
-    logging.info("\nEVALUATION COMPLETE")
-
-    return comparison
+    combined.to_csv(config.MODEL_COMPARISON_PATH)
+    logging.info(f"\n=== MODEL COMPARISON ===\n{combined.to_string()}")
+    logging.info(f"Saved {config.MODEL_COMPARISON_PATH}")
+    return combined

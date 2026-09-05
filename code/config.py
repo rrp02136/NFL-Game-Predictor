@@ -1,134 +1,79 @@
 """
-Configuration file for NFL Game Prediction Project
-All paths, column names, and hyperparameters are centralized here
+Configuration for NFL Game Prediction Pipeline
+Data comes from the nflverse project via the nfl_data_py package.
 """
-
 import os
-import glob
 
 # PATHS
-# Base Directories
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(BASE_DIR)
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+CACHE_DIR = os.path.join(DATA_DIR, 'cache')
 
-# Input Data Paths
-GAME_CSV_PATHS = [
-    os.path.join(DATA_DIR, 'Season_Scores', '2017_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2018_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2019_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2020_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2021_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2022_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2023_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2024_scores.csv'),
-    os.path.join(DATA_DIR, 'Season_Scores', '2025_scores.csv')
-]
-# Build PBP paths dynamically for weeks 1-17 for each year
-PBP_CSV_PATHS = []
-for year in range(2017, 2026):  # 2017 to 2025
-    for week in range(1, 18):  # Weeks 1-17 (regular season only)
-        path = os.path.join(DATA_DIR, 'Season_plays', 'new_format', f'{year}_plays_by_week', f'{year}_Week_{week}_plays.csv')
-        PBP_CSV_PATHS.append(path)
-
-# Output Paths
-CLEANED_DATA_PATH = os.path.join(DATA_DIR, 'cleaned_games.csv')
-RAW_GAMES_COMBINED_PATH = os.path.join(DATA_DIR, 'raw_games_combined.csv')
-RAW_PLAYS_COMBINED_PATH = os.path.join(DATA_DIR, 'raw_plays_combined.csv')
-MODEL_COMPARISON_PATH = os.path.join(DATA_DIR, 'model_comparison.csv')
-FEATURE_NAMES_PATH = os.path.join(DATA_DIR, 'feature_names.txt')
-LABEL_ENCODERS_PATH = os.path.join(DATA_DIR, 'label_encoders.pkl')
-
-# Model and Plot Directories
 MODELS_DIR = os.path.join(BASE_DIR, 'models')
 PLOTS_DIR = os.path.join(BASE_DIR, 'plots')
+RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
 
-# COLUMN NAME MAPPING
-# Game-level Scores Columns
-SEASON_COL = 'Season'
-WEEK_COL = 'Week'
-GAME_ID_COL = 'game_id'
-HOME_TEAM_COL = 'HomeTeam'
-AWAY_TEAM_COL = 'AwayTeam'
-HOME_SCORE_COL = 'HomeScore'
-AWAY_SCORE_COL = 'AwayScore'
-HOME_WIN_COL = 'HomeWin'
-POSTSEASON_COL = 'PostSeason'
+SCHEDULES_CACHE = os.path.join(CACHE_DIR, 'schedules.parquet')
+PBP_CACHE = os.path.join(CACHE_DIR, 'pbp_team_game.parquet')
+INJURIES_CACHE = os.path.join(CACHE_DIR, 'injuries.parquet')
+FEATURES_PATH = os.path.join(DATA_DIR, 'game_features.parquet')
+FEATURE_NAMES_PATH = os.path.join(DATA_DIR, 'feature_names.json')
+MODEL_COMPARISON_PATH = os.path.join(RESULTS_DIR, 'model_comparison.csv')
+ATS_BACKTEST_PATH = os.path.join(RESULTS_DIR, 'ats_backtest.csv')
+CALIBRATION_PATH = os.path.join(RESULTS_DIR, 'calibration.csv')
 
-# Advanced Stats Column (Optional)
-HOME_TOTAL_EPA_COL = None
-AWAY_TOTAL_EPA_COL = None
-HOME_PASS_EPA_COL = None
-AWAY_PASS_EPA_COL = None
-HOME_RUSH_EPA_COL = None
-AWAY_RUSH_EPA_COL = None
-HOME_OFF_EPA_COL = None
-AWAY_OFF_EPA_COL = None
-HOME_DEF_EPA_COL = None
-AWAY_DEF_EPA_COL = None
-SPREAD_LINE_COL = None
-TOTAL_LINE_COL = None
-HOME_TURNOVERS_COL = None
-AWAY_TURNOVERS_COL = None
+# DATA RANGE
+# The nflverse PBP dataset with EPA/success is reliable from 1999.
+# Model on the modern era only: 2002 is the current 32-team realignment.
+TRAIN_SEASON_START = 2002
+CURRENT_SEASON = 2026  # nfl_data_py fills this in as games are played
 
-# Play-by-Play Columns
-PBP_GAME_ID_COL = 'game_id'
-PBP_SEASON_COL = 'Season'
-PBP_WEEK_COL = 'Week'
-PBP_HOME_TEAM_COL = 'HomeTeam'
-PBP_AWAY_TEAM_COL = 'AwayTeam'
-PBP_POSTEAM_COL = 'TeamWithPossession'
-PBP_QUARTER_COL = 'Quarter'
-PBP_PLAY_TYPE_COL = 'PlayOutcome'
-PBP_IS_SCORING_COL = 'IsScoringPlay'
-PBP_IS_SCORING_DRIVE_COL = 'IsScoringDrive'
-PBP_PLAY_DESC_COL = 'PlayDescription'
+# MODELING
+TARGET_COL = 'home_win'
+# Time-based split — always test on the most recent full seasons
+TEST_SEASONS = [2024, 2025]  # holdout for honest accuracy
+# 2026 games (as they play) are for LIVE prediction, not test evaluation
 
-# TARGET VARIABLE
-TARGET_COL = 'home_team_win'
-
-# MODELING PARAMETERS
-# Data Split
-SPLIT_STRATEGY = 'time_based'
-TEST_SIZE = 0.2
 RANDOM_STATE = 42
-TIME_SPLIT_SEASON = 2024
+CV_FOLDS = 5
+CV_SCORING = 'neg_log_loss'  # log-loss = calibration-aware for betting
 
-# Random Forest Hyperparameter Grid
+# Feature engineering
+ROLLING_WINDOW = 8  # last N games per team for rolling averages
+ELO_K = 20.0
+ELO_HFA = 55.0   # home-field advantage in Elo points
+ELO_INIT = 1500.0
+ELO_SEASON_REGRESS = 0.25  # regress 25% toward 1500 between seasons
+
+# Hyperparameter grids — trimmed for practicality
 RF_PARAM_GRID = {
-    'n_estimators': [100, 200, 300],
-    'max_depth': [10, 20, 30],
-    'min_samples_split': [2, 5, 10],
-    'min_samples_leaf': [1, 2, 4],
-    'max_features': ['sqrt', 'log2']
+    'n_estimators': [300, 500],
+    'max_depth': [6, 10, None],
+    'min_samples_leaf': [5, 10, 20],
+    'max_features': ['sqrt'],
 }
 
-# XGBoost Hyperparameter Grid
 XGB_PARAM_GRID = {
-    'n_estimators': [100, 200, 300],
-    'max_depth': [3, 5, 7],
-    'learning_rate': [0.05, 0.1, 0.2],
+    'n_estimators': [200, 400],
+    'max_depth': [3, 5],
+    'learning_rate': [0.03, 0.05, 0.1],
     'subsample': [0.8, 1.0],
     'colsample_bytree': [0.8, 1.0],
-    'gamma': [0, 0.1]
+    'reg_lambda': [1.0, 3.0],
 }
 
-# Cross-Validation
-CV_FOLDS = 5
-CV_SCORING = 'accuracy'
+# BETTING ANALYSIS
+# Only flag bets where model edge over the market implied prob exceeds this.
+# 5 pp is a strong-signal threshold; smaller edges are noise.
+BET_EDGE_THRESHOLD = 0.05
+STANDARD_JUICE = -110  # for ATS backtest ROI
 
-# FEATURE ENGINEERING SETTINGS
-USE_PBP_FEATURES = True  # Set to False if not using play-by-play
-# Rolling Window for Team Averages
-ROLLING_WINDOW = 3
-# Categorical Columns to Encode
-CATEGORICAL_COLS = [HOME_TEAM_COL, AWAY_TEAM_COL]
-
-# PLOTTING SETTINGS
-PLOT_DPI = 300
+# PLOTTING
+PLOT_DPI = 150
 PLOT_FIGSIZE = (10, 6)
 TOP_N_FEATURES = 20
 
 # LOGGING
-LOG_LEVEL = 'INFO'  # 'DEBUG', 'INFO', 'WARNING', 'ERROR'
+LOG_LEVEL = 'INFO'
 LOG_FILE = os.path.join(BASE_DIR, 'pipeline.log')
