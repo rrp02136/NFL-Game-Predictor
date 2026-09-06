@@ -33,6 +33,9 @@ CURRENT_SEASON = 2026  # nfl_data_py fills this in as games are played
 TARGET_COL = 'home_win'
 # Time-based split — always test on the most recent full seasons
 TEST_SEASONS = [2024, 2025]  # holdout for honest accuracy
+# Held out from training and used to fit the isotonic calibrator only.
+# Choose a season that's recent (distribution close to test) but not in TEST_SEASONS.
+CALIBRATION_SEASONS = [2023]
 # 2026 games (as they play) are for LIVE prediction, not test evaluation
 
 RANDOM_STATE = 42
@@ -65,8 +68,9 @@ XGB_PARAM_GRID = {
 
 # BETTING ANALYSIS
 # Only flag bets where model edge over the market implied prob exceeds this.
-# 5 pp is a strong-signal threshold; smaller edges are noise.
+# 5 pp is a starting threshold; the pipeline reports ATS at multiple thresholds.
 BET_EDGE_THRESHOLD = 0.05
+ATS_EDGE_THRESHOLDS = [0.03, 0.05, 0.08, 0.10]  # backtest sweep
 STANDARD_JUICE = -110  # for ATS backtest ROI
 
 # PLOTTING

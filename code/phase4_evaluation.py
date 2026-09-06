@@ -1,12 +1,12 @@
 """
 Phase 4: Evaluation + betting-relevant diagnostics.
-Beyond accuracy/AUC we report:
-  - Brier score & log-loss (calibration-sensitive)
-  - Reliability diagram (are 60% predictions winning 60%?)
-  - ATS backtest: does betting when |model_prob - implied_prob| >= threshold profit?
+Reports accuracy, log-loss, Brier, ROC-AUC, reliability diagram, and an
+against-the-spread backtest across multiple edge thresholds.
 """
 import logging
 import os
+from math import erf, sqrt
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,9 +23,20 @@ def _american_to_prob(odds: float) -> float:
     return (-odds) / (-odds + 100.0) if odds < 0 else 100.0 / (odds + 100.0)
 
 
+def _underlying_estimator(model):
+    """Extract the raw fitted RF/XGB from CalibratedClassifierCV(FrozenEstimator(base))."""
+    if hasattr(model, 'calibrated_classifiers_') and model.calibrated_classifiers_:
+        est = model.calibrated_classifiers_[0].estimator
+        # est may itself be a FrozenEstimator wrapping the real classifier
+        if hasattr(est, 'estimator'):
+            est = est.estimator
+        return est
+    return model
+
+
 def evaluate_model(model, X_test, y_test, name: str) -> dict:
-    y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]
+    y_pred = (y_prob >= 0.5).astype(int)
     metrics = {
         'model': name,
         'accuracy': accuracy_score(y_test, y_pred),
@@ -68,14 +79,14 @@ def plot_reliability(y_true, y_prob, name: str, config, n_bins: int = 10):
     path = os.path.join(config.PLOTS_DIR, f'{name}_reliability.png')
     plt.savefig(path, dpi=config.PLOT_DPI); plt.close()
     logging.info(f"Saved {path}")
-    return agg
 
 
 def plot_feature_importance(model, feature_names, name: str, config):
-    if not hasattr(model, 'feature_importances_'):
+    est = _underlying_estimator(model)
+    if not hasattr(est, 'feature_importances_'):
         return
     imp = pd.DataFrame({'feature': feature_names,
-                        'importance': model.feature_importances_}).sort_values('importance', ascending=False)
+                        'importance': est.feature_importances_}).sort_values('importance', ascending=False)
     top = imp.head(config.TOP_N_FEATURES)
     plt.figure(figsize=(10, 8))
     plt.barh(range(len(top)), top['importance'])
@@ -91,64 +102,62 @@ def plot_feature_importance(model, feature_names, name: str, config):
         logging.info(f"  {row['feature']:40s}  {row['importance']:.4f}")
 
 
-def ats_backtest(test_context: pd.DataFrame, y_prob: np.ndarray, name: str, config) -> dict:
-    """
-    Convert spread_line to an implied home win probability using a normal-approx trick:
-    P(home covers ~= wins) ~ implied from moneyline; if moneyline missing, fall back to
-    approximating from spread with a 13.86-point sigma (historical NFL scoring stdev).
-    Bet home when model_prob - implied_prob > threshold; bet away otherwise (mirror).
-    ROI computed at -110 juice on 1-unit stakes.
-    """
+def _implied_home_prob(row) -> float:
+    hml, aml = row.get('home_moneyline', np.nan), row.get('away_moneyline', np.nan)
+    if not pd.isna(hml) and not pd.isna(aml):
+        h, a = _american_to_prob(hml), _american_to_prob(aml)
+        s = h + a
+        if s > 0:
+            return h / s
+    spread = row.get('spread_line', np.nan)
+    if not pd.isna(spread):
+        sigma = 13.86
+        return 0.5 * (1 + erf(spread / (sigma * sqrt(2))))
+    return np.nan
+
+
+def ats_backtest_sweep(test_context: pd.DataFrame, y_prob: np.ndarray,
+                       name: str, config) -> pd.DataFrame:
+    """Report ATS bets/hit/ROI at multiple edge thresholds; save the 5% bet log."""
     ctx = test_context.copy()
     ctx['model_home_prob'] = y_prob
-
-    # Prefer explicit home_moneyline if present; otherwise convert spread
-    home_ml = ctx['home_moneyline'].astype(float)
-    away_ml = ctx['away_moneyline'].astype(float)
-    implied_from_ml = home_ml.apply(_american_to_prob)
-    # Devig by symmetric normalization when both sides available
-    both = implied_from_ml + away_ml.apply(_american_to_prob)
-    both = both.where(both > 0, np.nan)
-    ctx['implied_home_prob'] = implied_from_ml / both
-
-    # Fallback: use spread_line if moneyline is missing (spread convention: negative = home favored)
-    missing = ctx['implied_home_prob'].isna() & ctx['spread_line'].notna()
-    from math import erf, sqrt
-    sigma = 13.86
-    if missing.any():
-        ctx.loc[missing, 'implied_home_prob'] = ctx.loc[missing, 'spread_line'].apply(
-            lambda s: 0.5 * (1 + erf(s / (sigma * (2 ** 0.5))))
-        )
-
+    ctx['implied_home_prob'] = ctx.apply(_implied_home_prob, axis=1)
     ctx['edge'] = ctx['model_home_prob'] - ctx['implied_home_prob']
     ctx['home_actual'] = ctx['home_win']
 
-    thr = config.BET_EDGE_THRESHOLD
-    bets = ctx[ctx['edge'].abs() >= thr].copy()
-    if bets.empty:
-        logging.info(f"[{name}] No bets clear the {thr:.0%} edge threshold")
-        return {'model': name, 'n_bets': 0, 'hit_rate': np.nan, 'roi': np.nan}
+    rows = []
+    for thr in config.ATS_EDGE_THRESHOLDS:
+        bets = ctx[ctx['edge'].abs() >= thr].copy()
+        if bets.empty:
+            rows.append({'model': name, 'edge_threshold': thr,
+                         'n_bets': 0, 'hit_rate': np.nan, 'roi': np.nan})
+            continue
+        bets['bet_home'] = (bets['edge'] > 0).astype(int)
+        bets['won_bet'] = ((bets['bet_home'] == 1) & (bets['home_actual'] == 1)) | \
+                         ((bets['bet_home'] == 0) & (bets['home_actual'] == 0))
+        payout = np.where(bets['won_bet'], 100 / 110, -1.0)  # -110 juice
+        rows.append({'model': name, 'edge_threshold': thr,
+                     'n_bets': int(len(bets)),
+                     'hit_rate': float(bets['won_bet'].mean()),
+                     'roi': float(payout.mean())})
 
-    # Bet home when edge > thr, bet away when edge < -thr
-    bets['bet_home'] = (bets['edge'] > 0).astype(int)
-    bets['won_bet'] = ((bets['bet_home'] == 1) & (bets['home_actual'] == 1)) | \
-                     ((bets['bet_home'] == 0) & (bets['home_actual'] == 0))
-    # -110 juice: risk 110 to win 100
-    payout = np.where(bets['won_bet'], 100 / 110, -1.0)
-    roi = payout.mean()
-    hit = bets['won_bet'].mean()
+        if abs(thr - config.BET_EDGE_THRESHOLD) < 1e-9:
+            out = os.path.join(config.RESULTS_DIR, f'{name}_ats_bets.csv')
+            bets[['game_id', 'season', 'week', 'home_team', 'away_team', 'spread_line',
+                  'model_home_prob', 'implied_home_prob', 'edge', 'bet_home',
+                  'home_actual', 'won_bet']].to_csv(out, index=False)
+            logging.info(f"Saved {out}")
 
-    logging.info(f"[{name}] ATS backtest: bets={len(bets)}, hit={hit:.2%}, ROI={roi:+.2%} "
-                 f"(break-even hit = 52.4%)")
-
-    out_path = os.path.join(config.RESULTS_DIR, f'{name}_ats_bets.csv')
-    ensure_directory(config.RESULTS_DIR)
-    bets[['game_id', 'season', 'week', 'home_team', 'away_team', 'spread_line',
-          'model_home_prob', 'implied_home_prob', 'edge', 'bet_home',
-          'home_actual', 'won_bet']].to_csv(out_path, index=False)
-    logging.info(f"Saved {out_path}")
-
-    return {'model': name, 'n_bets': int(len(bets)), 'hit_rate': float(hit), 'roi': float(roi)}
+    sweep = pd.DataFrame(rows)
+    logging.info(f"[{name}] ATS sweep:")
+    for _, r in sweep.iterrows():
+        thr_pct = f"{r['edge_threshold']:.0%}"
+        if r['n_bets'] == 0:
+            logging.info(f"  edge>={thr_pct}: no bets")
+        else:
+            logging.info(f"  edge>={thr_pct}: bets={r['n_bets']:4d}  hit={r['hit_rate']:.2%}  "
+                         f"ROI={r['roi']:+.2%}  (break-even = 52.4%)")
+    return sweep
 
 
 def evaluate_all_models(models: dict, X_test, y_test, feature_names: list,
@@ -157,7 +166,7 @@ def evaluate_all_models(models: dict, X_test, y_test, feature_names: list,
     ensure_directory(config.RESULTS_DIR)
 
     metric_rows = []
-    ats_rows = []
+    sweep_frames = []
     for name, entry in models.items():
         model = entry['model']
         y_prob = model.predict_proba(X_test)[:, 1]
@@ -168,13 +177,15 @@ def evaluate_all_models(models: dict, X_test, y_test, feature_names: list,
         plot_reliability(y_test.values, y_prob, name, config)
         plot_feature_importance(model, feature_names, name, config)
 
-        ats_rows.append(ats_backtest(test_context, y_prob, name, config))
+        sweep_frames.append(ats_backtest_sweep(test_context, y_prob, name, config))
 
     metrics_df = pd.DataFrame(metric_rows).set_index('model')
-    ats_df = pd.DataFrame(ats_rows).set_index('model')
-    combined = metrics_df.join(ats_df)
-
-    combined.to_csv(config.MODEL_COMPARISON_PATH)
-    logging.info(f"\n=== MODEL COMPARISON ===\n{combined.to_string()}")
+    metrics_df.to_csv(config.MODEL_COMPARISON_PATH)
+    logging.info(f"\n=== MODEL METRICS ===\n{metrics_df.to_string()}")
     logging.info(f"Saved {config.MODEL_COMPARISON_PATH}")
-    return combined
+
+    sweep = pd.concat(sweep_frames, ignore_index=True)
+    sweep.to_csv(config.ATS_BACKTEST_PATH, index=False)
+    logging.info(f"Saved {config.ATS_BACKTEST_PATH}")
+
+    return metrics_df
