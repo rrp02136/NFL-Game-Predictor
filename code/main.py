@@ -12,7 +12,7 @@ import config
 from utils_io import setup_logging, ensure_directory
 from phase1_exploration import load_schedules, load_team_game_pbp_aggregates, summarize
 from phase2_preprocessing import build_modeling_dataset
-from phase3_models import split_train_test, train_all_models
+from phase3_models import split_train_calib_test, train_all_models
 from phase4_evaluation import evaluate_all_models
 
 
@@ -36,13 +36,17 @@ def main(refresh_data: bool = False):
     with open(config.FEATURE_NAMES_PATH) as f:
         feature_cols = json.load(f)
 
-    # Phase 3: split + train
+    # Phase 3: split + train + calibrate
     logging.info("\n--- PHASE 3: TRAINING ---")
-    X_train, X_test, y_train, y_test, test_context = split_train_test(games, feature_cols, config)
+    X_fit, y_fit, X_cal, y_cal, X_test, y_test, test_context = split_train_calib_test(
+        games, feature_cols, config)
     if len(X_test) == 0:
         logging.error("Test set is empty. Check TEST_SEASONS in config.")
         sys.exit(1)
-    models = train_all_models(X_train, y_train, config)
+    if len(X_cal) == 0:
+        logging.error("Calibration set is empty. Check CALIBRATION_SEASONS in config.")
+        sys.exit(1)
+    models = train_all_models(X_fit, y_fit, X_cal, y_cal, config)
 
     # Phase 4: evaluate
     logging.info("\n--- PHASE 4: EVALUATION ---")

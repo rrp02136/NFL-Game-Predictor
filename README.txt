@@ -106,19 +106,36 @@ All knobs live in `code/config.py`:
 
 ## 5. Honest expectations & betting disclaimer
 
-- Straight-up NFL win prediction ceilings around **~65–68%** with strong
-  features. Anything above ~70% almost certainly means data leakage. The
-  reported numbers include a full test-set holdout on 2024–2025.
-- Beating the closing spread is much harder than picking winners. Pro sharps
-  hit **~53–55% ATS** long-term (break-even at -110 juice is 52.4%). Do not
-  expect this model to consistently beat that.
-- The Kelly fraction shown is **quarter-Kelly** — small on purpose. Even the
-  best models blow up bankrolls at full Kelly because true edges are smaller
-  than measured edges (variance and line movement work against you).
-- The backtest is retrospective and assumes the closing line — real-world
-  execution is worse. Track your actual results.
-- This is a research/educational project. Sports betting involves real risk of
-  loss. Bet only what you can afford to lose.
+**Current test-set results (2024–2025 holdout, 570 games):**
+
+| Model | Accuracy | AUC | Brier | ATS hit @ 10% edge | ATS ROI @ 10% |
+|---|---|---|---|---|---|
+| Random Forest (calibrated) | 68.1% | 0.734 | 0.210 | 49.3% (67 bets) | −6.0% |
+| XGBoost (calibrated)       | 66.5% | 0.710 | 0.214 | 39.7% (116 bets) | −24.3% |
+
+**What this means honestly:**
+
+- Straight-up NFL win prediction ceilings around **~65–70%** with strong
+  features. This model sits at 68.1%. Anything above ~72% almost certainly
+  means data leakage.
+- **Beating the closing spread is much harder than picking winners.** Pro
+  sharps hit **~53–55% ATS** long-term (break-even at -110 juice is 52.4%).
+  This model does NOT beat the closing NFL side spread — the ATS backtest is
+  negative at every edge threshold tested. That's the expected finding: full-
+  game NFL sides are the most efficient market in sports.
+- **How to actually use this responsibly:**
+  1. Straight-up predictions are useful for research and non-market decisions
+     (survivor pools, weekly picks against family, team-total prop research).
+  2. If you're going to bet, only use it as one input among many, and
+     preferentially on markets where the line is stale or thin (early-week
+     openers, less-followed props, live in-game lines).
+  3. The Kelly fraction shown is **quarter-Kelly** — small on purpose. Even
+     the best models blow up bankrolls at full Kelly because measured edges
+     are optimistic vs. real-world edges (variance, line movement, juice).
+- The backtest is retrospective and assumes the closing line — real execution
+  is worse (you'll get worse lines than the closer).
+- Sports betting involves real risk of loss. Bet only what you can afford to
+  lose. This project is educational, not financial advice.
 
 ---
 

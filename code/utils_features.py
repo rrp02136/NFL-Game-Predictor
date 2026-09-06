@@ -4,8 +4,67 @@ All rolling features are computed from a team's PRIOR games only (shift(1))
 so nothing from the game being predicted leaks in.
 """
 import logging
+import math
 import numpy as np
 import pandas as pd
+
+
+# Approximate lat/lon of each team's home stadium (nflverse team codes).
+# Used for travel-distance feature. Shared venues use the same coords.
+STADIUM_COORDS: dict[str, tuple[float, float]] = {
+    'ARI': (33.5276, -112.2626),  # State Farm, Glendale
+    'ATL': (33.7554, -84.4008),   # Mercedes-Benz
+    'BAL': (39.2780, -76.6227),   # M&T Bank
+    'BUF': (42.7738, -78.7870),   # Highmark
+    'CAR': (35.2258, -80.8528),   # Bank of America
+    'CHI': (41.8623, -87.6167),   # Soldier Field
+    'CIN': (39.0954, -84.5160),   # Paycor
+    'CLE': (41.5061, -81.6996),   # Cleveland Browns Stadium
+    'DAL': (32.7473, -97.0945),   # AT&T
+    'DEN': (39.7439, -105.0201),  # Empower
+    'DET': (42.3400, -83.0456),   # Ford Field
+    'GB':  (44.5013, -88.0622),   # Lambeau
+    'HOU': (29.6847, -95.4107),   # NRG
+    'IND': (39.7601, -86.1639),   # Lucas Oil
+    'JAX': (30.3239, -81.6373),   # EverBank
+    'KC':  (39.0489, -94.4839),   # Arrowhead
+    'LA':  (33.9535, -118.3392),  # SoFi (legacy code for Rams)
+    'LAC': (33.9535, -118.3392),  # SoFi (Chargers)
+    'LAR': (33.9535, -118.3392),  # SoFi (Rams)
+    'LV':  (36.0909, -115.1830),  # Allegiant
+    'MIA': (25.9580, -80.2389),   # Hard Rock
+    'MIN': (44.9738, -93.2581),   # U.S. Bank
+    'NE':  (42.0910, -71.2643),   # Gillette
+    'NO':  (29.9508, -90.0812),   # Caesars Superdome
+    'NYG': (40.8135, -74.0745),   # MetLife
+    'NYJ': (40.8135, -74.0745),   # MetLife
+    'OAK': (37.7516, -122.2005),  # Legacy Raiders (pre-2020)
+    'PHI': (39.9008, -75.1675),   # Lincoln Financial
+    'PIT': (40.4468, -80.0158),   # Acrisure
+    'SD':  (32.7831, -117.1196),  # Legacy Chargers (pre-2017)
+    'SEA': (47.5952, -122.3316),  # Lumen
+    'SF':  (37.4032, -121.9700),  # Levi's
+    'STL': (38.6329, -90.1885),   # Legacy Rams (pre-2016)
+    'TB':  (27.9759, -82.5033),   # Raymond James
+    'TEN': (36.1665, -86.7713),   # Nissan
+    'WAS': (38.9078, -76.8645),   # Northwest / FedEx
+}
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Great-circle distance in km between two lat/lon points."""
+    R = 6371.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+
+def _american_to_prob(odds) -> float:
+    if pd.isna(odds):
+        return np.nan
+    return (-odds) / (-odds + 100.0) if odds < 0 else 100.0 / (odds + 100.0)
 
 
 def build_team_game_long(schedules: pd.DataFrame, pbp_agg: pd.DataFrame) -> pd.DataFrame:
@@ -182,6 +241,31 @@ def build_game_features(schedules: pd.DataFrame, pbp_agg: pd.DataFrame, config) 
     games = games.merge(elo, on='game_id', how='left')
     games['elo_diff'] = games['home_elo_pre'] - games['away_elo_pre']
 
+    # Travel distance: how far the AWAY team traveled to the home stadium
+    def _travel(row):
+        h = STADIUM_COORDS.get(row['home_team'])
+        a = STADIUM_COORDS.get(row['away_team'])
+        if h is None or a is None:
+            return np.nan
+        return _haversine_km(h[0], h[1], a[0], a[1])
+    games['away_travel_km'] = games.apply(_travel, axis=1)
+    games['away_travel_km'] = games['away_travel_km'].fillna(games['away_travel_km'].median())
+
+    # Market features: convert moneylines to devigged implied home win prob
+    h_prob = games['home_moneyline'].apply(_american_to_prob)
+    a_prob = games['away_moneyline'].apply(_american_to_prob)
+    both = h_prob + a_prob
+    games['market_home_prob'] = h_prob / both.where(both > 0)
+    # Fallback: derive from spread if moneyline missing (13.86 = historical NFL score sigma)
+    sigma = 13.86
+    missing = games['market_home_prob'].isna() & games['spread_line'].notna()
+    games.loc[missing, 'market_home_prob'] = games.loc[missing, 'spread_line'].apply(
+        lambda s: 0.5 * (1 + math.erf(s / (sigma * math.sqrt(2))))
+    )
+    # Absolute spread magnitude (favorite strength) and total (game pace)
+    games['spread_line'] = games['spread_line'].astype(float)
+    games['total_line'] = games['total_line'].astype(float)
+
     # Target
     games = games.dropna(subset=['home_score', 'away_score'])
     games['home_win'] = (games['home_score'] > games['away_score']).astype(int)
@@ -201,9 +285,13 @@ def select_feature_columns(games: pd.DataFrame, config) -> list[str]:
         f'pts_for_r{r}_diff', f'pts_against_r{r}_diff', f'won_r{r}_diff',
     ]
     other = [
-        'elo_diff', 'rest_diff',
+        'elo_diff', 'rest_diff', 'away_travel_km',
         'div_game', 'is_playoff', 'roof_outdoor', 'temp', 'wind',
         'home_elo_pre', 'away_elo_pre',
+        # Market features — the single most predictive input for a betting model.
+        # Included deliberately so the model defers to Vegas by default and only
+        # overrides when its own signals strongly disagree.
+        'spread_line', 'total_line', 'market_home_prob',
     ]
     cols = [c for c in diffs + other if c in games.columns]
     return cols
